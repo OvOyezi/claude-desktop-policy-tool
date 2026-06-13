@@ -1,0 +1,28 @@
+name: Windows test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run isolated registry tests
+        shell: cmd
+        run: call Claude-Policy-Tool.cmd --self-test
+
+      - name: Build release package
+        shell: powershell
+        run: .\tools\build-release.ps1
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-desktop-policy-tool
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt

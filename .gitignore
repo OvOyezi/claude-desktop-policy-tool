@@ -1,0 +1,7 @@
+dist/
+ClaudePolicyBackups/
+Backups/
+*.reg
+*.log
+.DS_Store
+Thumbs.db
