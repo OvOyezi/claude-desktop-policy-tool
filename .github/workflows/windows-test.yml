@@ -15,6 +15,10 @@ jobs:
         shell: cmd
         run: call Claude-Policy-Tool.cmd --self-test
 
+      - name: Run isolated regression tests
+        shell: powershell
+        run: .\tools\test-regressions.ps1
+
       - name: Build release package
         shell: powershell
         run: .\tools\build-release.ps1

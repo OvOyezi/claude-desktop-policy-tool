@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 
 $ToolId = 'ClaudePolicyTool'
 $SchemaVersion = 1
-$ToolVersion = '1.0.0'
+$ToolVersion = '1.0.1'
 $ScriptPath = [IO.Path]::GetFullPath($env:CPT_SELF)
 $ScriptRoot = Split-Path -Parent $ScriptPath
 $DataRoot = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
@@ -253,10 +253,55 @@ function Invoke-Reg {
     [pscustomobject]@{ exitCode = $exitCode; output = $output }
 }
 
+function Initialize-RegistryReader {
+    if ('ClaudePolicyTool.RegistryReader' -as [type]) { return }
+    # Keep the Win32 status: reg.exe collapses failures to 1 and OpenSubKey
+    # can return null for errors other than a missing key.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace ClaudePolicyTool {
+    public static class RegistryReader {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern int RegOpenKeyExW(IntPtr root, string path, int options, int access, out IntPtr key);
+        [DllImport("advapi32.dll", ExactSpelling = true)]
+        private static extern int RegCloseKey(IntPtr key);
+        public static int Probe(bool machine, string path, int view) {
+            IntPtr root = new IntPtr(machine ? unchecked((int)0x80000002) : unchecked((int)0x80000001));
+            IntPtr key = IntPtr.Zero;
+            try {
+                // KEY_READ plus an explicit WOW64 view. No values are read.
+                return RegOpenKeyExW(root, path, 0, 0x20019 | (view == 64 ? 0x0100 : 0x0200), out key);
+            } finally {
+                if (key != IntPtr.Zero) RegCloseKey(key);
+            }
+        }
+    }
+}
+'@
+}
+
 function Test-TargetExists {
     param($Target)
-    $result = Invoke-Reg -Arguments @('query', $Target.regPath, "/reg:$($Target.view)") -AllowFailure
-    $result.exitCode -eq 0
+    try {
+        if ($Target.hive -notin @('HKLM', 'HKCU')) { throw '不支持的注册表根。' }
+        if ($Target.view -notin @(32, 64)) { throw '不支持的注册表视图。' }
+        $prefix = $Target.hive + '\'
+        if (-not $Target.regPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+            $Target.regPath.Length -le $prefix.Length) {
+            throw '注册表路径与目标根不一致。'
+        }
+        Initialize-RegistryReader
+        $code = [ClaudePolicyTool.RegistryReader]::Probe(($Target.hive -eq 'HKLM'), $Target.regPath.Substring($prefix.Length), $Target.view)
+        switch ($code) {
+            0 { return $true }
+            2 { return $false } # ERROR_FILE_NOT_FOUND
+            3 { return $false } # ERROR_PATH_NOT_FOUND
+            default { throw (New-Object ComponentModel.Win32Exception($code)) }
+        }
+    } catch {
+        throw "无法读取策略目标 $($Target.id)（$($Target.regPath)，$($Target.view) 位），不能判断为未发现策略。请检查注册表读取权限或联系设备管理员。技术详情：$($_.Exception.Message)"
+    }
 }
 
 function Export-Target {
@@ -562,21 +607,35 @@ function Get-ManagementState {
 
 function Show-PolicyStatus {
     param([object[]]$Targets = $ProductionTargets)
-    Write-Section 'Claude 策略状态'
+    Write-Section 'Claude Desktop 策略状态'
     $present = 0
+    $readErrors = @()
     foreach ($target in $Targets) {
-        $exists = Test-TargetExists $target
-        if ($exists) { $present++ }
-        $color = if ($exists) { 'Yellow' } else { 'Green' }
         $scope = if ($target.hive -eq 'HKLM') { '整台电脑' } else { '当前用户' }
-        Write-Host ('  [{0} / {1} 位]  {2}' -f $scope, $target.view, $(if ($exists) { '存在策略' } else { '未发现策略' })) -ForegroundColor $color
+        try {
+            $exists = Test-TargetExists $target
+            if ($exists) { $present++ }
+            $color = if ($exists) { 'Yellow' } else { 'Green' }
+            $state = if ($exists) { '存在策略' } else { '未发现策略' }
+        } catch {
+            $readErrors += $_.Exception.Message
+            $color = 'Red'
+            $state = '读取失败，状态未知'
+        }
+        Write-Host ('  [{0} / {1} 位]  {2}' -f $scope, $target.view, $state) -ForegroundColor $color
         Write-Host "      $($target.regPath)" -ForegroundColor DarkGray
     }
     Write-Host ''
+    if ($readErrors.Count -gt 0) {
+        throw ("策略检查不完整，已停止操作。读取失败不等于没有策略：`n  - " + ($readErrors -join "`n  - "))
+    }
     if ($present -gt 0) {
         Write-Host '检测到 Claude Desktop 管理策略，第三方推理配置窗口可能处于只读状态。' -ForegroundColor Yellow
     } else {
-        Write-Host '未检测到 Claude Desktop 策略键，第三方推理配置窗口应当可以编辑。' -ForegroundColor Green
+        Write-Host '检查范围内未发现 Claude Desktop 管理策略，无需解锁。' -ForegroundColor Green
+        Write-Host '这不代表第三方推理入口一定可用；本工具不会创建 API 地址、密钥或模型配置。' -ForegroundColor Yellow
+        Write-Host '若使用 Claude Code 或 CC Switch，请核对所选应用及其 API 配置；移除 Desktop 策略不会生成这些配置。'
+        Write-Host '若 Claude Desktop 仍显示“由组织管理”，请提供应用版本、被锁定页面截图和 --diagnose 输出，分享前遮挡敏感信息。'
     }
     $management = @(Get-ManagementState)
     if ($management.Count -gt 0) {
@@ -584,6 +643,7 @@ function Show-PolicyStatus {
         Write-Host '警告：此设备可能受到组织管理，策略可能会被管理员重新下发：' -ForegroundColor Yellow
         $management | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
     }
+    return $present
 }
 
 function Show-RestartInstructions {
@@ -594,7 +654,7 @@ function Show-RestartInstructions {
 
 function Show-Diagnostics {
     $report = Show-CompatibilityReport
-    Show-PolicyStatus
+    $null = Show-PolicyStatus
     Write-Section '诊断结论'
     if (-not $report.ready) {
         Write-Host '当前环境不适合执行解锁或恢复。请先处理上方红色问题。' -ForegroundColor Red
@@ -610,29 +670,31 @@ function Show-Help {
     Write-Host '  - 可以从本工具创建的备份中完整恢复策略。'
     Write-Host ''
     Write-Host '这个工具不会做什么：' -ForegroundColor Yellow
-    Write-Host '  - 不会修改 ClaudeCode 策略、Claude API 配置或其他软件策略。'
+    Write-Host '  - 不会修改 ClaudeCode 策略、Claude Code / CC Switch 配置文件或其他软件策略。'
+    Write-Host '  - 不会为 Claude Code / CC Switch 创建 API 地址、密钥或模型配置。'
     Write-Host '  - 不会上传备份、API 密钥或任何本机数据。'
     Write-Host '  - 不会强制关闭 Claude Desktop。'
     Write-Host ''
-    Write-Host '建议流程：先选 1 诊断，再选 2 解锁；需要回滚时选 3 恢复。' -ForegroundColor Green
+    Write-Host '建议流程：先选 1 诊断；存在 Desktop 策略且需要移除时选 2；需要回滚时选 3。' -ForegroundColor Green
+    Write-Host '显示“未发现策略”时无需解锁；它不代表第三方推理页面一定可编辑。'
     Write-Host "备份保存在：$BackupRoot" -ForegroundColor Green
 }
 
 function Invoke-Unlock {
-    Assert-CompatibleForWrite
-    Ensure-Administrator '--unlock'
     Write-Title
-    Show-PolicyStatus
-    $existing = @($ProductionTargets | Where-Object { Test-TargetExists $_ })
-    if ($existing.Count -eq 0) {
+    $present = Show-PolicyStatus
+    if ($present -eq 0) {
         Write-Host ''
         Write-Host '当前没有需要解锁的策略，未修改注册表。' -ForegroundColor Green
         return
     }
+    Ensure-Administrator '--unlock'
+    Assert-CompatibleForWrite
 
     Write-Host ''
     Write-Host '接下来会先完整备份，然后只删除上方列出的 Claude 策略键。' -ForegroundColor White
     Write-Host '注意：备份可能包含管理员配置的 URL、请求头或凭据，请勿上传或分享备份目录。' -ForegroundColor Yellow
+    Write-Host '目标策略中包含的 API 地址、凭据或模型设置也会随策略移除；本工具不会生成替代配置。' -ForegroundColor Yellow
     $management = @(Get-ManagementState)
     if ($management.Count -gt 0) {
         Write-Host ''
@@ -944,7 +1006,7 @@ function Show-Menu {
 
 try {
     switch ($Action.ToLowerInvariant()) {
-        '--status' { Write-Title; Show-PolicyStatus }
+        '--status' { Write-Title; $null = Show-PolicyStatus }
         '--diagnose' { Write-Title; Show-Diagnostics }
         '--unlock' { Invoke-Unlock; Pause-Console }
         '--restore' { Invoke-RestoreInteractive; Pause-Console }
@@ -958,6 +1020,6 @@ try {
     Write-Host '发生错误：' -ForegroundColor Red
     Write-Host '技术详情（供排查，可能包含系统原始文本）：' -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Red
-    if ($Action -notin @('--status', '--self-test')) { Pause-Console }
+    if ($Action -notin @('--status', '--diagnose', '--self-test')) { Pause-Console }
     exit 1
 }

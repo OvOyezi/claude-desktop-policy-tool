@@ -9,7 +9,9 @@ HKLM\SOFTWARE\Policies\Claude
 HKCU\SOFTWARE\Policies\Claude
 ```
 
-不会修改 `ClaudeCode` 策略、第三方 API 地址、API 密钥、模型配置或其他软件的组策略。
+不会修改 `ClaudeCode` 策略或其他软件的组策略，也不会创建 API 地址、API 密钥或模型配置，或编辑 Claude Code、CC Switch 的配置文件。如果目标 Claude 策略中包含地址、凭据或模型设置，移除策略时会一并移除这些设置。
+
+Claude Desktop 的注册表策略与 Claude Code、CC Switch 管理的配置属于不同范围。CC Switch 也支持管理 Claude Desktop 的第三方推理配置；本工具不创建或修改这类配置文件。
 
 ## 适用场景
 
@@ -28,11 +30,13 @@ Claude Desktop 的第三方推理页面出现以下情况：
 
 1. 打开仓库右侧的 **Releases**。
 2. 进入最新版本。
-3. 下载 `Claude-Desktop-Policy-Tool-v1.0.0.zip`。
+3. 下载发布页列出的 ZIP 文件。
 4. 解压 ZIP，不要直接在压缩包预览窗口中运行。
 5. 可使用发布页提供的 `SHA256SUMS.txt` 核对文件完整性。
 
 也可以直接下载 Release 附件中的 `Claude-Policy-Tool.cmd`。
+
+本仓库的 v1.0.1 更改尚未发布；已发布版本的功能请以对应 Release 为准。
 
 ## 系统要求
 
@@ -40,7 +44,7 @@ Claude Desktop 的第三方推理页面出现以下情况：
 | --- | --- |
 | 操作系统 | Windows 10 或 Windows 11 |
 | PowerShell | Windows PowerShell 5.1 |
-| 权限 | 检查无需管理员权限；解锁和恢复需要 UAC 管理员授权 |
+| 权限 | 检查无需管理员权限；需要写入时，解锁和恢复需要 UAC 管理员授权 |
 | 架构 | x64、ARM64；32 位 Windows 仅提供兼容处理，不是主要测试环境 |
 | 其他组件 | Windows 自带的 `reg.exe` 和 PowerShell JSON 组件 |
 
@@ -75,16 +79,16 @@ Claude Desktop 官方要求 Windows 10 或更高版本。工具会在写入前�
 
 工具会按照以下顺序执行：
 
-1. 检查必要组件和备份目录。
-2. 请求管理员权限。
-3. 显示将要处理的策略范围。
+1. 检查指定范围内的策略状态。任何目标读取失败时，停止写入，不把错误当作策略不存在。
+2. 如果所有目标均可读取且没有策略，提示后结束，不申请 UAC、创建备份或修改注册表。
+3. 如果发现策略，显示处理范围、请求管理员权限，并检查运行环境和备份条件。
 4. 如果设备受组织管理，要求额外确认已获得管理员授权。
 5. 要求输入 `确认解锁`。
 6. 完整导出策略、生成清单和 SHA-256 校验值。
 7. 校验备份后才删除精确的 Claude 策略键。
 8. 再次确认策略确实消失。
 
-成功后，请保存工作，完全退出 Claude Desktop（包括系统托盘），再手动重新打开。工具不会强制结束 Claude，避免造成会话或未保存内容丢失。
+成功移除策略后，请保存工作，完全退出 Claude Desktop（包括系统托盘），再手动重新打开。工具不会强制结束 Claude，避免造成会话或未保存内容丢失。
 
 ### 3. 恢复原始策略
 
@@ -124,6 +128,7 @@ SHA-256 清单用于发现意外损坏或未同步修改，不是数字签名。
 ## 安全设计
 
 - 默认入口是只读诊断。
+- 读取策略失败时停止写入；无策略时不申请管理员权限或创建备份。
 - 写操作前必须完成备份并通过校验。
 - 只删除 `SOFTWARE\Policies\Claude`，不会删除父级 `Policies`。
 - 不处理 `SOFTWARE\Policies\ClaudeCode`。
@@ -134,6 +139,14 @@ SHA-256 清单用于发现意外损坏或未同步修改，不是数字签名。
 - 测试仅使用随机的 `HKCU\Software\ClaudePolicyToolTests` 路径，并在结束后清理。
 
 ## 常见问题
+
+### 为什么选择解锁后提示未发现策略？
+
+这表示所有目标均已成功读取，工具在指定的 Claude Desktop 策略范围内没有找到可移除的策略；这不代表应用的推理页面一定可以编辑，也不会自动创建 API 或模型配置。如果诊断提示读取失败，请先处理该错误，再重新诊断。
+
+先确认实际使用的应用及版本。如果是 Claude Desktop，检查相关页面和组织管理状态，并参考 [Claude Desktop 企业配置文档](https://support.claude.com/en/articles/12622667-enterprise-configuration-for-claude-desktop)或联系设备管理员。Claude Code 的设置请参考 [Claude Code 文档](https://code.claude.com/docs/en/settings)；如果通过 CC Switch 管理配置，也可查看 [CC Switch 项目](https://github.com/farion1231/cc-switch)。
+
+仍需帮助时，请提供实际应用名称和版本，以及运行 `Claude-Policy-Tool.cmd --diagnose` 的输出；如果页面被锁定，请附上截图。发送前请遮挡 API 密钥、令牌、网关地址和其他敏感信息；不要公开上传策略备份。
 
 ### 提示缺少 Windows PowerShell 5.1
 
@@ -188,6 +201,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build-release.ps
 - [安装 Claude Desktop](https://support.claude.com/en/articles/10065433-install-claude-desktop)
 - [Windows 企业配置](https://support.claude.com/en/articles/12622667-enterprise-configuration-for-claude-desktop)
 - [Windows 部署说明](https://support.claude.com/en/articles/12622703-deploy-claude-desktop-for-windows)
+- [Claude Code 设置文件](https://code.claude.com/docs/en/settings)
 
 ## 许可证
 

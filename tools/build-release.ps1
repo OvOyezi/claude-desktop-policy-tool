@@ -1,8 +1,9 @@
 ﻿param(
-    [string]$Version = '1.0.0'
+    [string]$Version = '1.0.1'
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $root = Split-Path -Parent $PSScriptRoot
 $tool = Join-Path $root 'Claude-Policy-Tool.cmd'
 $dist = Join-Path $root 'dist'
@@ -40,7 +41,13 @@ if ($process.ExitCode -ne 0) {
 }
 
 if (Test-Path -LiteralPath $dist) {
-    Remove-Item -LiteralPath $dist -Recurse -Force
+    $resolvedDist = (Resolve-Path -LiteralPath $dist).Path
+    $expectedDist = [IO.Path]::GetFullPath((Join-Path $root 'dist'))
+    if ($resolvedDist -ne $expectedDist -or
+        ((Get-Item -LiteralPath $dist -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "拒绝清理非预期的发布目录：$dist"
+    }
+    Remove-Item -LiteralPath $resolvedDist -Recurse
 }
 [void](New-Item -ItemType Directory -Path $stage -Force)
 
