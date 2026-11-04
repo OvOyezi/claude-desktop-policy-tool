@@ -111,7 +111,8 @@ function Test-LocalPolicyContainsClaude {
                 $bytes = [IO.File]::ReadAllBytes($path)
                 $unicode = [Text.Encoding]::Unicode.GetString($bytes)
                 $ascii = [Text.Encoding]::ASCII.GetString($bytes)
-                if ($unicode -match '(?i)Software\\Policies\\Claude' -or $ascii -match '(?i)Software\\Policies\\Claude') {
+                $pattern = '(?i)Software\\Policies\\Claude(?=\\|\x00|;|$)'
+                if ($unicode -match $pattern -or $ascii -match $pattern) {
                     return $true
                 }
             }
@@ -145,30 +146,25 @@ function Get-CompatibilityReport {
     }
     try {
         foreach ($path in @($DataRoot, $BackupRoot)) {
-            if (Test-Path -LiteralPath $path) {
-                $item = Get-Item -LiteralPath $path -Force
-                if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    $errors += "备份路径是符号链接或目录联接，为防止备份被重定向，已拒绝写操作：$path"
-                }
-            }
+            Assert-SafeBackupPath $path -AllowMissing
         }
     } catch {
-        $warnings += "无法完整检查备份路径属性：$($_.Exception.Message)"
+        $errors += "备份路径检查失败，已拒绝写操作：$($_.Exception.Message)"
     }
     if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
         $warnings += "PowerShell 当前处于 $($ExecutionContext.SessionState.LanguageMode) 模式，组织安全策略可能阻止部分操作。"
     }
     if (-not [Environment]::Is64BitOperatingSystem) {
-        $warnings += '检测到 32 位 Windows。工具会仅处理 32 位注册表视图；当前 Claude Desktop 通常使用 64 位 Windows。'
+        $warnings += '检测到 32 位 Windows，工具仅检查和处理 32 位注册表视图。此系统尚未经过本项目测试。'
     }
     if (-not (Test-ClaudeInstalled)) {
-        $warnings += '未检测到 Claude Desktop。工具仍可检查或清理策略，但不会立即看到界面变化。'
+        $warnings += '未检测到 Claude Desktop 安装。仍可检查和处理注册表策略，请自行确认应用是否已安装。'
     }
 
     $information += "Windows：$([Environment]::OSVersion.VersionString)"
-    $information += "系统架构：$($env:PROCESSOR_ARCHITECTURE)；64 位系统：$(if ([Environment]::Is64BitOperatingSystem) { '是' } else { '否' })"
+    $information += "进程架构：$($env:PROCESSOR_ARCHITECTURE)；64 位系统：$(if ([Environment]::Is64BitOperatingSystem) { '是' } else { '否' })"
     $information += "Windows PowerShell：$($PSVersionTable.PSVersion)"
-    $information += "管理员权限：$(if (Test-Administrator) { '已获得' } else { '当前未获得，执行解锁或恢复时会请求 UAC 授权' })"
+    $information += "管理员权限：$(if (Test-Administrator) { '已获得' } else { '未获得，需要写入策略时会请求 UAC 授权' })"
     $information += "备份目录：$BackupRoot"
 
     [pscustomobject]@{
@@ -206,6 +202,7 @@ function Assert-CompatibleForWrite {
     }
     try {
         [void](New-Item -ItemType Directory -Path $BackupRoot -Force)
+        Assert-SafeBackupPath $BackupRoot
         $probe = Join-Path $BackupRoot ('.write-test-' + [guid]::NewGuid().ToString('N'))
         [IO.File]::WriteAllText($probe, 'test', $Utf8NoBom)
         Remove-Item -LiteralPath $probe -Force
@@ -220,14 +217,37 @@ function Test-Administrator {
     $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Assert-UserContext {
+    param([string]$ExpectedSid)
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSid) -and
+        $ExpectedSid -cne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
+        throw 'UAC 提权使用了另一个 Windows 账户。为避免修改错误账户的 HKCU 策略或使用错误的备份目录，操作已停止，未修改注册表。请由设备管理员在需要处理策略的账户上下文中操作。'
+    }
+}
+
+function New-ElevationCommand {
+    param([string]$Path, [ValidateSet('--unlock', '--restore')][string]$RequestedAction, [string]$ExpectedSid)
+    $quotedPath = $Path.Replace("'", "''")
+    $quotedSid = $ExpectedSid.Replace("'", "''")
+    # Avoid cmd.exe CALL's second expansion of percent signs in the script path.
+    $command = @"
+`$env:CPT_SELF = '$quotedPath'
+`$env:CPT_ACTION = '$RequestedAction'
+`$env:CPT_EXPECTED_SID = '$quotedSid'
+Invoke-Expression ((Get-Content -Encoding UTF8 -LiteralPath `$env:CPT_SELF | Select-Object -Skip 12) -join [Environment]::NewLine)
+"@
+    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+}
+
 function Ensure-Administrator {
     param([string]$RequestedAction)
     if (Test-Administrator) { return }
 
     Write-Host '此操作需要管理员权限，正在打开 Windows 用户账户控制确认窗口……' -ForegroundColor Yellow
     try {
-        $arguments = "/d /c call `"$ScriptPath`" $RequestedAction"
-        Start-Process -FilePath $env:ComSpec -ArgumentList $arguments -WorkingDirectory $ScriptRoot -Verb RunAs | Out-Null
+        $encoded = New-ElevationCommand $ScriptPath $RequestedAction ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        Start-Process -FilePath $powershell -ArgumentList "-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded" -WorkingDirectory $ScriptRoot -Verb RunAs | Out-Null
     } catch {
         throw "管理员权限请求被取消或执行失败：$($_.Exception.Message)"
     }
@@ -352,17 +372,68 @@ function Write-TextUtf8 {
     [IO.File]::WriteAllText($FilePath, $Text, $Utf8NoBom)
 }
 
+function Get-BytesSha256 {
+    param([byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '') }
+    finally { $sha.Dispose() }
+}
+
+function Assert-SafeBackupPath {
+    param([string]$Path, [switch]$AllowMissing)
+    # Check every existing component, including ancestors and dangling links.
+    # Resolve-Path alone is lexical and does not resolve NTFS junction targets.
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full -notmatch '^[A-Za-z]:\\' -or $full.Substring(3).Contains(':')) {
+        throw "备份路径必须是本地磁盘上的普通路径：$Path"
+    }
+    $current = [IO.Path]::GetPathRoot($full)
+    foreach ($part in @('') + @($full.Substring($current.Length).TrimEnd('\').Split('\'))) {
+        if ($part.Length -gt 0) {
+            if ($part.EndsWith('.') -or $part.EndsWith(' ')) { throw "备份路径包含不明确的目录名：$Path" }
+            $current = Join-Path $current $part
+        }
+        try { $attributes = [IO.File]::GetAttributes($current) }
+        catch {
+            $cause = $_.Exception.GetBaseException()
+            if ($AllowMissing -and ($cause -is [IO.FileNotFoundException] -or $cause -is [IO.DirectoryNotFoundException])) { return }
+            throw "无法检查备份路径属性：$current。$($cause.Message)"
+        }
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "备份路径包含符号链接、目录联接或其他重解析点：$current"
+        }
+    }
+}
+
+function Remove-SafeScratchDirectory {
+    param([string]$Directory)
+    Assert-SafeBackupPath $Directory
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push($Directory)
+    while ($pending.Count -gt 0) {
+        foreach ($path in [IO.Directory]::GetFileSystemEntries($pending.Pop())) {
+            $attributes = [IO.File]::GetAttributes($path)
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "拒绝清理包含重解析点的临时目录：$path" }
+            if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { $pending.Push($path) }
+        }
+    }
+    Remove-Item -LiteralPath $Directory -Recurse
+}
+
 function New-BackupSet {
     param(
         [object[]]$Targets,
         [string]$Root,
         [string]$Kind
     )
+    Assert-SafeBackupPath $Root -AllowMissing
     [void](New-Item -ItemType Directory -Path $Root -Force)
+    Assert-SafeBackupPath $Root
     $safeKind = $Kind -replace '[^A-Za-z0-9_-]', '_'
     $name = '{0}-{1}-{2}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $safeKind, ([guid]::NewGuid().ToString('N').Substring(0,8))
     $directory = Join-Path $Root $name
     [void](New-Item -ItemType Directory -Path $directory)
+    Assert-SafeBackupPath $directory
 
     $entries = @()
     try {
@@ -408,13 +479,15 @@ function New-BackupSet {
         Write-TextUtf8 (Join-Path $directory 'manifest.sha256') (Get-Sha256 $manifestPath)
         return $directory
     } catch {
-        Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+        try { Remove-SafeScratchDirectory $directory } catch { Write-Warning "未能清理失败的备份目录：$directory。$($_.Exception.Message)" }
         throw
     }
 }
 
 function Assert-DirectoryInsideRoot {
     param([string]$Directory, [string]$Root)
+    Assert-SafeBackupPath $Root
+    Assert-SafeBackupPath $Directory
     $resolvedDirectory = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Directory).Path).TrimEnd('\')
     $resolvedRoot = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Root).Path).TrimEnd('\')
     if (-not $resolvedDirectory.StartsWith($resolvedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
@@ -423,23 +496,53 @@ function Assert-DirectoryInsideRoot {
 }
 
 function Assert-RegFileScope {
-    param([string]$FilePath, $Target)
-    $text = [IO.File]::ReadAllText($FilePath)
-    $matches = [regex]::Matches($text, '(?m)^\[([^\]]+)\]\s*$')
-    if ($matches.Count -eq 0) {
-        throw "备份文件中没有找到注册表键：$FilePath"
+    param([string]$FilePath, $Target, [byte[]]$Bytes)
+    if ($null -eq $Bytes) { $Bytes = [IO.File]::ReadAllBytes($FilePath) }
+    # reg.exe export writes UTF-16LE with a BOM. Parse every line of that format;
+    # never ignore a line just because a section-header regex did not match it.
+    if ($Bytes.Length -lt 2 -or $Bytes[0] -ne 255 -or $Bytes[1] -ne 254 -or $Bytes.Length % 2 -ne 0) {
+        throw '备份注册表文件不是 reg.exe 导出的 UTF-16LE 格式。'
     }
-    foreach ($match in $matches) {
-        $key = $match.Groups[1].Value
-        if ($key.StartsWith('-', [StringComparison]::Ordinal)) {
-            throw "备份文件中不允许包含注册表删除指令：$FilePath"
+    $encoding = New-Object Text.UnicodeEncoding($false, $true, $true)
+    $text = $encoding.GetString($Bytes, 2, $Bytes.Length - 2)
+    if ($text.Contains([string][char]0)) { throw '备份注册表文件包含无效的空字符。' }
+    $lines = [regex]::Split($text, '\r\n|\n|\r')
+    if ($lines[0] -cne 'Windows Registry Editor Version 5.00') { throw '备份注册表文件头无效。' }
+    $sections = 0
+    $continuation = $false
+    $quoted = '"(?:[^"\\]|\\["\\])*"'
+    for ($index = 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ($continuation) {
+            if ($line -notmatch '^  (?:[0-9a-fA-F]{2},)*[0-9a-fA-F]{2}(?:,\\)?$') { throw "备份注册表文件的十六进制续行无效（行 $($index + 1)）。" }
+            $continuation = $line.EndsWith('\')
+            continue
         }
-        $allowed = $key.Equals($Target.fullRoot, [StringComparison]::OrdinalIgnoreCase) -or
-                   $key.StartsWith($Target.fullRoot + '\', [StringComparison]::OrdinalIgnoreCase)
-        if (-not $allowed) {
-            throw "备份中发现超出允许范围的注册表键：$key"
+        if ($line.Length -eq 0) { continue }
+        # Use the final closing bracket: ']' is legal inside a registry key name.
+        $section = [regex]::Match($line, '^\[(.+)\]$')
+        if ($section.Success) {
+            $key = $section.Groups[1].Value
+            if ($key.StartsWith('-')) { throw '备份文件中不允许包含注册表删除指令。' }
+            if (-not ($key.Equals($Target.fullRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                $key.StartsWith($Target.fullRoot + '\', [StringComparison]::OrdinalIgnoreCase))) {
+                throw "备份中发现超出允许范围的注册表键：$key"
+            }
+            $sections++
+            continue
         }
+        if ($sections -eq 0) { throw '备份注册表值出现在注册表键之前。' }
+        $value = [regex]::Match($line, ('^(?:@|' + $quoted + ')=(.*)$'))
+        if (-not $value.Success) { throw "备份注册表文件包含不支持或不安全的内容（行 $($index + 1)）。" }
+        $data = $value.Groups[1].Value
+        if ($data -cmatch ('^' + $quoted + '$') -or $data -match '^dword:[0-9a-fA-F]{8}$') { continue }
+        $hex = [regex]::Match($data, '^hex(?:\([0-9a-fA-F]+\))?:(.*)$')
+        if (-not $hex.Success -or $hex.Groups[1].Value -notmatch '^(?:(?:[0-9a-fA-F]{2},)*[0-9a-fA-F]{2}(?:,\\)?)?$') {
+            throw "备份注册表值的格式无效（行 $($index + 1)）。"
+        }
+        $continuation = $data.EndsWith('\')
     }
+    if ($sections -eq 0 -or $continuation) { throw '备份注册表文件缺少键或续行不完整。' }
 }
 
 function Read-ValidatedBackup {
@@ -455,47 +558,59 @@ function Read-ValidatedBackup {
 
     $manifestPath = Join-Path $Directory 'manifest.json'
     $checksumPath = Join-Path $Directory 'manifest.sha256'
+    Assert-SafeBackupPath $manifestPath
+    Assert-SafeBackupPath $checksumPath
     if (-not (Test-Path -LiteralPath $manifestPath) -or -not (Test-Path -LiteralPath $checksumPath)) {
         throw '备份清单或校验文件缺失。'
     }
     $expectedManifestHash = ([IO.File]::ReadAllText($checksumPath)).Trim().ToUpperInvariant()
-    if ($expectedManifestHash -notmatch '^[0-9A-F]{64}$' -or (Get-Sha256 $manifestPath) -ne $expectedManifestHash) {
+    $manifestBytes = [IO.File]::ReadAllBytes($manifestPath)
+    if ($expectedManifestHash -notmatch '^[0-9A-F]{64}$' -or (Get-BytesSha256 $manifestBytes) -ne $expectedManifestHash) {
         throw '备份清单的完整性校验失败。'
     }
 
-    $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
-    if ($manifest.toolId -ne $ToolId -or [int]$manifest.schemaVersion -ne $SchemaVersion) {
+    $manifest = ([Text.Encoding]::UTF8.GetString($manifestBytes)).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    if ($manifest.toolId -isnot [string] -or $manifest.toolId -cne $ToolId -or
+        ($manifest.schemaVersion -isnot [int] -and $manifest.schemaVersion -isnot [long]) -or $manifest.schemaVersion -ne $SchemaVersion) {
         throw '此备份不是由本工具的兼容版本生成，已拒绝恢复。'
     }
 
+    if ($manifest.targets -isnot [array]) { throw '备份目标列表必须是 JSON 数组。' }
     $entries = @($manifest.targets)
     if ($entries.Count -ne $ExpectedTargets.Count) {
         throw '备份目标数量与允许的目标列表不一致。'
     }
 
+    $snapshots = @{}
     foreach ($target in $ExpectedTargets) {
         $matching = @($entries | Where-Object { $_.id -eq $target.id })
         if ($matching.Count -ne 1) {
             throw "备份目标缺失或重复：$($target.id)"
         }
         $entry = $matching[0]
-        if ($entry.hive -ne $target.hive -or [int]$entry.view -ne $target.view -or
-            $entry.regPath -ne $target.regPath -or $entry.fullRoot -ne $target.fullRoot) {
-            throw "备份目标元数据已被修改：$($target.id)"
+        if ($entry.id -isnot [string] -or $entry.hive -isnot [string] -or $entry.hive -cne $target.hive -or
+            ($entry.view -isnot [int] -and $entry.view -isnot [long]) -or $entry.view -ne $target.view -or
+            $entry.regPath -isnot [string] -or $entry.regPath -ine $target.regPath -or
+            $entry.fullRoot -isnot [string] -or $entry.fullRoot -ine $target.fullRoot -or $entry.existed -isnot [bool]) {
+            throw "备份目标元数据与允许的目标不一致：$($target.id)"
         }
-        if ([bool]$entry.existed) {
+        if ($entry.existed) {
             $expectedName = "$($target.id).reg"
-            if ($entry.backupFile -ne $expectedName -or [string]::IsNullOrWhiteSpace([string]$entry.sha256)) {
+            if ($entry.backupFile -isnot [string] -or $entry.backupFile -cne $expectedName -or
+                $entry.sha256 -isnot [string] -or $entry.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
                 throw "备份文件元数据无效：$($target.id)"
             }
             $filePath = Join-Path $Directory $expectedName
+            Assert-SafeBackupPath $filePath
             if (-not (Test-Path -LiteralPath $filePath)) {
                 throw "备份文件缺失：$expectedName"
             }
-            if ((Get-Sha256 $filePath) -ne ([string]$entry.sha256).ToUpperInvariant()) {
+            $bytes = [IO.File]::ReadAllBytes($filePath)
+            if ((Get-BytesSha256 $bytes) -ne $entry.sha256.ToUpperInvariant()) {
                 throw "备份文件完整性校验失败：$expectedName"
             }
-            Assert-RegFileScope $filePath $target
+            Assert-RegFileScope $filePath $target -Bytes $bytes
+            $snapshots[$target.id] = $bytes
         } else {
             if ($null -ne $entry.backupFile -or $null -ne $entry.sha256) {
                 throw "原本不存在的目标包含异常备份元数据：$($target.id)"
@@ -506,6 +621,7 @@ function Read-ValidatedBackup {
     [pscustomobject]@{
         directory = [IO.Path]::GetFullPath($Directory)
         manifest = $manifest
+        snapshots = $snapshots
     }
 }
 
@@ -540,23 +656,45 @@ function Assert-StateMatchesBackup {
 
 function Apply-ValidatedBackupUnsafe {
     param($ValidatedBackup, [object[]]$Targets)
-    Remove-AllTargets $Targets
-    foreach ($target in $Targets) {
-        $entry = Get-ManifestEntry $ValidatedBackup $target
-        if ([bool]$entry.existed) {
-            Import-Target $target (Join-Path $ValidatedBackup.directory $entry.backupFile)
+    $stage = Join-Path ([IO.Path]::GetTempPath()) ('ClaudePolicyImport-' + [guid]::NewGuid().ToString('N'))
+    Assert-SafeBackupPath $stage -AllowMissing
+    [void](New-Item -ItemType Directory -Path $stage)
+    $leases = New-Object 'System.Collections.Generic.List[System.IO.FileStream]'
+    try {
+        # Prepare all imports before deleting anything. Import only the bytes that
+        # passed both the hash and scope checks, never reopen the mutable source.
+        foreach ($target in $Targets) {
+            $entry = Get-ManifestEntry $ValidatedBackup $target
+            if ($entry.existed) {
+                [byte[]]$bytes = $ValidatedBackup.snapshots[$target.id]
+                if ((Get-BytesSha256 $bytes) -ne $entry.sha256.ToUpperInvariant()) { throw '备份快照完整性校验失败。' }
+                $file = Join-Path $stage $entry.backupFile
+                Assert-RegFileScope $file $target -Bytes $bytes
+                [IO.File]::WriteAllBytes($file, $bytes)
+                $leases.Add([IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read))
+                if ((Get-Sha256 $file) -ne $entry.sha256.ToUpperInvariant()) { throw '导入暂存文件完整性校验失败。' }
+            }
         }
+        Remove-AllTargets $Targets
+        foreach ($target in $Targets) {
+            $entry = Get-ManifestEntry $ValidatedBackup $target
+            if ($entry.existed) { Import-Target $target (Join-Path $stage $entry.backupFile) }
+        }
+        Assert-StateMatchesBackup $ValidatedBackup $Targets
+    } finally {
+        foreach ($lease in $leases) { $lease.Dispose() }
+        Remove-SafeScratchDirectory $stage
     }
-    Assert-StateMatchesBackup $ValidatedBackup $Targets
 }
 
 function Restore-BackupTransaction {
     param(
         [string]$Directory,
         [object[]]$Targets,
-        [string]$Root
+        [string]$Root,
+        $ValidatedBackup = $null
     )
-    $requested = Read-ValidatedBackup $Directory $Targets $Root
+    $requested = if ($null -eq $ValidatedBackup) { Read-ValidatedBackup $Directory $Targets $Root } else { $ValidatedBackup }
     $rollbackDirectory = New-BackupSet $Targets $Root 'BeforeRestore'
     $rollback = Read-ValidatedBackup $rollbackDirectory $Targets $Root
     try {
@@ -633,14 +771,14 @@ function Show-PolicyStatus {
         Write-Host '检测到 Claude Desktop 管理策略，第三方推理配置窗口可能处于只读状态。' -ForegroundColor Yellow
     } else {
         Write-Host '检查范围内未发现 Claude Desktop 管理策略，无需解锁。' -ForegroundColor Green
-        Write-Host '这不代表第三方推理入口一定可用；本工具不会创建 API 地址、密钥或模型配置。' -ForegroundColor Yellow
-        Write-Host '若使用 Claude Code 或 CC Switch，请核对所选应用及其 API 配置；移除 Desktop 策略不会生成这些配置。'
+        Write-Host '页面是否可编辑还取决于应用自身的配置。本工具不会创建 API 地址、密钥或模型配置。' -ForegroundColor Yellow
+        Write-Host '若使用 Claude Code 或通过 CC Switch 管理配置，请核对所选应用及其 API 设置。'
         Write-Host '若 Claude Desktop 仍显示“由组织管理”，请提供应用版本、被锁定页面截图和 --diagnose 输出，分享前遮挡敏感信息。'
     }
     $management = @(Get-ManagementState)
     if ($management.Count -gt 0) {
         Write-Host ''
-        Write-Host '警告：此设备可能受到组织管理，策略可能会被管理员重新下发：' -ForegroundColor Yellow
+        Write-Host '检测到组织管理迹象，策略可能被重新下发：' -ForegroundColor Yellow
         $management | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
     }
     return $present
@@ -659,24 +797,22 @@ function Show-Diagnostics {
     if (-not $report.ready) {
         Write-Host '当前环境不适合执行解锁或恢复。请先处理上方红色问题。' -ForegroundColor Red
     } else {
-        Write-Host '当前环境具备运行条件。实际写操作仍会先备份、校验并再次确认。' -ForegroundColor Green
+        Write-Host '运行条件检查通过。写入前仍需确认操作，并完成备份和校验。' -ForegroundColor Green
     }
 }
 
 function Show-Help {
-    Write-Section '这个工具会做什么'
-    Write-Host '  - 检查并备份 Claude Desktop 的 HKLM/HKCU 管理策略。'
-    Write-Host '  - 在明确确认后，仅删除 SOFTWARE\Policies\Claude 策略键。'
-    Write-Host '  - 可以从本工具创建的备份中完整恢复策略。'
+    Write-Section '使用说明'
+    Write-Host '先选 1 诊断；发现需要移除的 Desktop 策略时选 2；需要恢复备份时选 3。' -ForegroundColor Green
+    Write-Host '工具检查 HKLM/HKCU 下的 SOFTWARE\Policies\Claude 策略键。'
+    Write-Host '确认解锁后，先备份并校验，再删除策略；恢复时会另存当前状态，并核对恢复结果。'
     Write-Host ''
-    Write-Host '这个工具不会做什么：' -ForegroundColor Yellow
-    Write-Host '  - 不会修改 ClaudeCode 策略、Claude Code / CC Switch 配置文件或其他软件策略。'
-    Write-Host '  - 不会为 Claude Code / CC Switch 创建 API 地址、密钥或模型配置。'
-    Write-Host '  - 不会上传备份、API 密钥或任何本机数据。'
-    Write-Host '  - 不会强制关闭 Claude Desktop。'
+    Write-Host 'API 地址、密钥和模型配置需在对应应用中设置。移除策略不保证页面可编辑。' -ForegroundColor Yellow
+    Write-Host 'ClaudeCode 策略、Claude Code / CC Switch 配置文件及其他软件策略不在处理范围内。'
+    Write-Host '显示“未发现策略”时无需解锁。受组织管理的设备请先取得管理员授权。'
     Write-Host ''
-    Write-Host '建议流程：先选 1 诊断；存在 Desktop 策略且需要移除时选 2；需要回滚时选 3。' -ForegroundColor Green
-    Write-Host '显示“未发现策略”时无需解锁；它不代表第三方推理页面一定可编辑。'
+    Write-Host '工具不联网，也不上传本机数据。备份可能含有凭据，请妥善保管。'
+    Write-Host '操作后请保存工作，完全退出 Claude Desktop，再手动重新打开。'
     Write-Host "备份保存在：$BackupRoot" -ForegroundColor Green
 }
 
@@ -729,33 +865,35 @@ function Invoke-Unlock {
     }
 
     Write-Host ''
-    Write-Host '操作成功：Claude Desktop 策略已解锁。' -ForegroundColor Green
+    Write-Host 'Claude Desktop 管理策略已移除。请重新打开应用检查设置。' -ForegroundColor Green
     Write-Host "用于恢复的原始备份：$backupDirectory" -ForegroundColor Green
     Show-RestartInstructions
 }
 
 function Get-BackupCandidates {
     if (-not (Test-Path -LiteralPath $BackupRoot)) { return @() }
+    Assert-SafeBackupPath $BackupRoot
     @(Get-ChildItem -LiteralPath $BackupRoot -Directory | Where-Object {
         Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json')
     } | Sort-Object LastWriteTime -Descending)
 }
 
 function Invoke-RestoreInteractive {
-    Assert-CompatibleForWrite
-    Ensure-Administrator '--restore'
     Write-Title
     $candidates = @(Get-BackupCandidates)
     if ($candidates.Count -eq 0) {
         Write-Host '没有找到由本工具创建的策略备份。' -ForegroundColor Yellow
         return
     }
+    Ensure-Administrator '--restore'
+    Assert-CompatibleForWrite
 
     Write-Host '可用的策略备份：' -ForegroundColor Cyan
     $max = [Math]::Min($candidates.Count, 20)
     for ($i = 0; $i -lt $max; $i++) {
         $manifestPath = Join-Path $candidates[$i].FullName 'manifest.json'
         try {
+            Assert-SafeBackupPath $manifestPath
             $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
             $kindLabel = switch ([string]$manifest.kind) {
                 'BeforeUnlock' { '解锁前备份' }
@@ -796,9 +934,9 @@ function Invoke-RestoreInteractive {
         return
     }
 
-    $result = Restore-BackupTransaction $validated.directory $ProductionTargets $BackupRoot
+    $result = Restore-BackupTransaction $validated.directory $ProductionTargets $BackupRoot -ValidatedBackup $validated
     Write-Host ''
-    Write-Host '操作成功：注册表策略内容已完整恢复，并通过精确校验。' -ForegroundColor Green
+    Write-Host '策略已恢复，重新导出的内容与备份一致。' -ForegroundColor Green
     Write-Host "恢复前安全备份：$($result.rollbackDirectory)" -ForegroundColor Green
     Show-RestartInstructions
 }
@@ -935,20 +1073,28 @@ function Invoke-SelfTest {
         if (-not $rejected) { throw '被篡改的备份没有被拒绝。' }
         $passed++; Write-Host '[通过] 导入前会拒绝被篡改的备份内容' -ForegroundColor Green
 
-        $brokenDirectory = Join-Path $testRoot ('Broken-' + [guid]::NewGuid().ToString('N'))
-        Copy-Item -LiteralPath $baselineDirectory -Destination $brokenDirectory -Recurse
-        $brokenFile = Join-Path $brokenDirectory "$($primaryTarget.id).reg"
-        $brokenContent = "Windows Registry Editor Version 5.00`r`n`r`n[$($primaryTarget.fullRoot)]`r`n`"Broken`"=hex:GG`r`n"
-        [IO.File]::WriteAllText($brokenFile, $brokenContent, [Text.Encoding]::Unicode)
-        $brokenManifestPath = Join-Path $brokenDirectory 'manifest.json'
-        $brokenManifest = [IO.File]::ReadAllText($brokenManifestPath) | ConvertFrom-Json
-        (@($brokenManifest.targets | Where-Object { $_.id -eq $primaryTarget.id })[0]).sha256 = Get-Sha256 $brokenFile
-        Write-TextUtf8 $brokenManifestPath ($brokenManifest | ConvertTo-Json -Depth 8)
-        Rewrite-ManifestChecksum $brokenDirectory
+        $key = Get-RegistryKeyForTest $primaryTarget
+        try { $key.SetValue('StringValue', 'before-failed-restore', [Microsoft.Win32.RegistryValueKind]::String) } finally { $key.Dispose() }
+        $beforeFailureDirectory = New-BackupSet $testTargets $testRoot 'RollbackControl'
+        $beforeFailure = Read-ValidatedBackup $beforeFailureDirectory $testTargets $testRoot
+        $originalImport = ${function:Import-Target}
+        $importFault = @{ remaining = 1; observedAbsent = $false }
+        function Import-Target {
+            param($Target, [string]$FilePath)
+            if ($importFault.remaining -gt 0) {
+                $importFault.remaining--
+                $importFault.observedAbsent = -not (Test-TargetExists $Target)
+                throw 'Self-test injected an import failure after target deletion.'
+            }
+            & $originalImport $Target $FilePath
+        }
         $rollbackTriggered = $false
-        try { Restore-BackupTransaction $brokenDirectory $testTargets $testRoot | Out-Null } catch { $rollbackTriggered = $true }
-        if (-not $rollbackTriggered) { throw '损坏的恢复流程没有触发事务回滚。' }
-        Assert-StateMatchesBackup $baseline $testTargets
+        try { Restore-BackupTransaction $baselineDirectory $testTargets $testRoot | Out-Null }
+        catch { $rollbackTriggered = $_.Exception.Message -like '*已成功自动还原到恢复前状态*' }
+        finally { Set-Item -LiteralPath Function:Import-Target -Value $originalImport }
+        if (-not $rollbackTriggered -or -not $importFault.observedAbsent) { throw '删除后的导入失败没有触发事务回滚。' }
+        Assert-StateMatchesBackup $beforeFailure $testTargets
+        Apply-ValidatedBackupUnsafe $baseline $testTargets
         $passed++; Write-Host '[通过] 恢复中途失败会精确回滚到原始状态' -ForegroundColor Green
 
         $scopeDirectory = Join-Path $testRoot ('Scope-' + [guid]::NewGuid().ToString('N'))
@@ -1005,6 +1151,7 @@ function Show-Menu {
 }
 
 try {
+    Assert-UserContext $env:CPT_EXPECTED_SID
     switch ($Action.ToLowerInvariant()) {
         '--status' { Write-Title; $null = Show-PolicyStatus }
         '--diagnose' { Write-Title; Show-Diagnostics }
@@ -1017,8 +1164,7 @@ try {
     exit 0
 } catch {
     Write-Host ''
-    Write-Host '发生错误：' -ForegroundColor Red
-    Write-Host '技术详情（供排查，可能包含系统原始文本）：' -ForegroundColor Red
+    Write-Host '操作失败，详情如下：' -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Red
     if ($Action -notin @('--status', '--diagnose', '--self-test')) { Pause-Console }
     exit 1

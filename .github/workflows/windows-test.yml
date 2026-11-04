@@ -19,6 +19,22 @@ jobs:
         shell: powershell
         run: .\tools\test-regressions.ps1
 
+      - name: Check restore format and manifest boundaries
+        shell: powershell
+        run: .\tools\test-restore-boundaries.ps1 -ResultPath "$env:RUNNER_TEMP\claude-restore-tests.json"
+
+      - name: Check backup paths and content snapshots
+        shell: powershell
+        run: .\tools\test-backup-paths.ps1 -ResultPath "$env:RUNNER_TEMP\claude-path-tests.json"
+
+      - name: Check runtime edge cases
+        shell: powershell
+        run: .\tools\test-runtime-edges.ps1 -ResultPath "$env:RUNNER_TEMP\claude-runtime-tests.json"
+
+      - name: Check release output boundaries
+        shell: powershell
+        run: .\tools\test-build-boundaries.ps1 -ResultPath "$env:RUNNER_TEMP\claude-build-tests.json"
+
       - name: Build release package
         shell: powershell
         run: .\tools\build-release.ps1
