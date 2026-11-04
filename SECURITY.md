@@ -6,7 +6,7 @@
 
 ## 报告安全问题
 
-请通过 GitHub 仓库的 **Security → Report a vulnerability** 私下报告安全问题。不要在公开 Issue 中粘贴：
+本仓库目前未启用 GitHub 私密漏洞报告功能。如需报告，请先通过 [Issue](https://github.com/OvOyezi/claude-desktop-policy-tool/issues/new) 提交不含漏洞细节和敏感信息的联系请求，与维护者确认私下报告方式。不要在公开 Issue 中粘贴：
 
 - 注册表备份文件；
 - API 密钥、令牌或自定义请求头；
