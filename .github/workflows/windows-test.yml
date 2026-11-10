@@ -19,6 +19,10 @@ jobs:
         shell: cmd
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\test-regressions.ps1
 
+      - name: Run isolated local configuration tests
+        shell: cmd
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\test-local-config.ps1
+
       - name: Check restore format and manifest boundaries
         shell: cmd
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\test-restore-boundaries.ps1 -ResultPath "%RUNNER_TEMP%\claude-restore-tests.json"

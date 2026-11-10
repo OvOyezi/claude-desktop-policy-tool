@@ -52,6 +52,7 @@ $script:ensureCalls = 0
 $script:compatibilityCalls = 0
 $script:removeCalls = 0
 $script:backupCalls = 0
+$script:localScanCalls = 0
 $script:allowBackupTest = $false
 $script:realInvokeReg = ${function:Invoke-Reg}
 $script:realNewBackupSet = ${function:New-BackupSet}
@@ -145,6 +146,13 @@ function Ensure-Administrator { $script:ensureCalls++; throw 'TEST HARNESS: elev
 function Assert-CompatibleForWrite { $script:compatibilityCalls++; throw 'TEST HARNESS: write compatibility called' }
 function Remove-AllTargets { $script:removeCalls++; throw 'TEST HARNESS: registry write called' }
 function Get-ManagementState { return @() }
+function Get-ClaudeConfigRoots {
+    $script:localScanCalls++
+    return (Join-Path $testRoot 'LocalConfigFixture')
+}
+function Get-ClaudeDesktopRuntime { return [pscustomobject]@{ processes = @(); otherUsers = @(); launch = $null } }
+function Stop-ClaudeDesktop { throw 'TEST HARNESS: process termination called' }
+function Start-ClaudeDesktop { throw 'TEST HARNESS: process launch called' }
 function Write-Title { Write-Host 'Claude Policy Tool regression test' }
 function Read-Host { throw 'TEST HARNESS: interactive input called' }
 function New-BackupSet {
@@ -165,6 +173,7 @@ function Reset-GuardCounts {
     $script:compatibilityCalls = 0
     $script:removeCalls = 0
     $script:backupCalls = 0
+    $script:localScanCalls = 0
 }
 
 $views = if ([Environment]::Is64BitOperatingSystem) { @(64, 32) } else { @(32) }
@@ -231,29 +240,30 @@ try {
         }
     }
 
-    Invoke-RegressionCase '无策略状态包含用途指引且不承诺配置可编辑' {
+    Invoke-RegressionCase '无注册表策略时不承诺配置可编辑或无需解锁' {
         $output = @(Show-PolicyStatus -Targets @($fixtures[0].missing) 6>&1)
         $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
-        Assert-Regression ($text -notmatch '应当可以编辑') '无策略时不能保证配置窗口可以编辑。'
-        Assert-Regression ($text -match 'Claude Code' -and $text -match 'CC Switch' -and $text -match 'API') '缺少 Claude Code、CC Switch 或 API 配置的用途指引。'
+        Assert-Regression ($output[-1] -is [int] -and $output[-1] -eq 0) '未准确返回注册表策略数量。'
+        Assert-Regression ($text -notmatch '应当可以编辑|可以直接编辑|无需解锁|没有需要解锁') '无策略时不能推断配置可编辑或无需解锁。'
     }
 
-    Invoke-RegressionCase '无策略解锁不提升权限、不检查写入且不创建备份' {
+    Invoke-RegressionCase '无注册表策略、已应用配置和运行实例时不提权或创建备份' {
         Reset-GuardCounts
         $script:ProductionTargets = @($fixtures[0].missing)
         Assert-Regression (-not (Test-Path -LiteralPath $BackupRoot)) '测试前备份目录不应存在。'
         $output = @(Invoke-Unlock 6>&1)
         $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
         Assert-Regression ($script:ensureCalls -eq 0 -and $script:compatibilityCalls -eq 0 -and $script:removeCalls -eq 0 -and $script:backupCalls -eq 0) '无策略时调用了提权或写入路径。'
-        Assert-Regression (-not (Test-Path -LiteralPath $BackupRoot)) '无策略时创建了备份目录。'
-        Assert-Regression ($text -match '没有需要解锁的策略') '未明确提示无需解锁。'
+        Assert-Regression (-not (Test-Path -LiteralPath $BackupRoot) -and -not (Test-Path -LiteralPath (Get-LocalConfigBackupRoot))) '无可处理的策略或配置时创建了备份目录。'
+        Assert-Regression ($script:localScanCalls -gt 0) '无注册表策略时未检查本地配置。'
+        Assert-Regression ($text -notmatch '应当可以编辑|可以直接编辑|无需解锁|没有需要解锁') '检查完成后给出了无法确认的可编辑结论。'
     }
 
     Invoke-RegressionCase '混合存在和拒绝读取时状态展示失败并抛错' {
         $f = $fixtures[0]
         $records = New-Object 'System.Collections.Generic.List[object]'
         $threw = $false
-        try { Show-PolicyStatus -Targets @($f.present, $f.denied) 6>&1 | ForEach-Object { $records.Add($_) } } catch { $threw = $true }
+        try { Show-PolicyStatus -Targets @($f.present, $f.denied) -Detailed 6>&1 | ForEach-Object { $records.Add($_) } } catch { $threw = $true }
         $text = ($records | ForEach-Object { $_.ToString() }) -join "`n"
         $presentPath = [regex]::Escape($f.present.regPath)
         $deniedPath = [regex]::Escape($f.denied.regPath)
@@ -266,14 +276,12 @@ try {
     Invoke-RegressionCase '混合存在和拒绝读取时解锁停止且不提权或写入' {
         Reset-GuardCounts
         $script:ProductionTargets = @($fixtures[0].present, $fixtures[0].denied)
-        $records = New-Object 'System.Collections.Generic.List[object]'
         $threw = $false
         $errorText = ''
-        try { Invoke-Unlock 6>&1 | ForEach-Object { $records.Add($_) } } catch { $threw = $true; $errorText = $_.Exception.Message }
-        $text = ($records | ForEach-Object { $_.ToString() }) -join "`n"
+        try { $null = Invoke-Unlock 6>&1 } catch { $threw = $true; $errorText = $_.Exception.Message }
         Assert-Regression $threw '读取失败时解锁应停止并抛错。'
         Assert-Regression ($errorText -notmatch 'TEST HARNESS') '解锁在读取失败前调用了提权或写入路径。'
-        Assert-Regression ($text -match '读取失败') '解锁未明确报告读取失败。'
+        Assert-Regression ($errorText -match '读取失败') '解锁未明确报告读取失败。'
         Assert-Regression ($script:ensureCalls -eq 0 -and $script:compatibilityCalls -eq 0 -and $script:removeCalls -eq 0 -and $script:backupCalls -eq 0) '读取失败后仍调用了提权或写入路径。'
         Assert-Regression (-not (Test-Path -LiteralPath $BackupRoot)) '读取失败时创建了备份目录。'
     }

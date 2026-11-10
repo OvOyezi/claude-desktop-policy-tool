@@ -4,17 +4,16 @@
 
 ## 开发原则
 
-- 默认只读；任何注册表写操作都必须在明确确认之后发生。
-- 策略读取失败不能视为不存在；无法确认策略状态时不得写入。
-- 没有可移除策略时，解锁不得申请 UAC、创建备份或写入注册表。
-- 删除前必须创建并验证可恢复备份。
-- 不扩大到 `SOFTWARE\Policies\Claude` 之外的注册表范围。
-- 面向普通用户的提示使用简体中文；内部代码、清单字段和测试数据可以使用英文。
-- 不提交真实 `.reg` 备份、API 密钥、令牌或企业设备信息。
+- 诊断保持只读。修改注册表或本地配置前，须经用户明确确认，并创建、验证可恢复的备份。
+- 策略读取失败时停止写操作。确认没有注册表策略后，才能按本地配置的流程解锁，且无需申请 UAC。
+- 注册表操作限定在 `SOFTWARE\Policies\Claude`。修改本地配置时，只处理受支持的 `Claude-3p\configLibrary` 中当前已应用的配置。
+- 重启前确认 Claude Desktop 进程的身份和运行账户。
+- 用户提示使用简体中文，内部代码、清单字段和测试数据可以使用英文。
+- 不提交真实的注册表或本地配置备份、API 密钥、令牌及企业设备信息。
 
 ## 提交前检查
 
-在项目根目录运行：
+在项目根目录运行以下命令。
 
 ```powershell
 .\Claude-Policy-Tool.cmd --diagnose
@@ -23,8 +22,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\test-regressions
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\test-restore-boundaries.ps1 -ResultPath "$env:TEMP\claude-restore-tests.json"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\test-backup-paths.ps1 -ResultPath "$env:TEMP\claude-path-tests.json"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\test-runtime-edges.ps1 -ResultPath "$env:TEMP\claude-runtime-tests.json"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\test-local-config.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\test-build-boundaries.ps1 -ResultPath "$env:TEMP\claude-build-tests.json"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build-release.ps1
 ```
 
-自检只能使用 `HKCU\Software\ClaudePolicyToolTests` 下的随机路径，不得触碰真实 Claude 策略。构建脚本会删除并重建项目中的 `dist` 目录，请提前移走其中需要保留的文件。
+注册表自检只使用 `HKCU\Software\ClaudePolicyToolTests` 下的随机路径。本地配置测试使用临时目录中的测试文件。构建脚本会删除并重建项目中的 `dist` 目录，请提前移走其中需要保留的文件。

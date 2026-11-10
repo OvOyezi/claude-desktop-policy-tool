@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 
 $ToolId = 'ClaudePolicyTool'
 $SchemaVersion = 1
-$ToolVersion = '1.0.1'
+$ToolVersion = '1.1.0'
 $ScriptPath = [IO.Path]::GetFullPath($env:CPT_SELF)
 $ScriptRoot = Split-Path -Parent $ScriptPath
 $DataRoot = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
@@ -743,16 +743,340 @@ function Get-ManagementState {
     @($signals)
 }
 
+function Get-ClaudeConfigRoots {
+    @(
+        (Join-Path $env:LOCALAPPDATA 'Claude-3p'),
+        (Join-Path $env:LOCALAPPDATA 'Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\Claude-3p'),
+        (Join-Path $env:APPDATA 'Claude-3p'),
+        (Join-Path $env:LOCALAPPDATA 'Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude-3p')
+    ) | Select-Object -Unique
+}
+
+function Read-ConfigJson {
+    param([byte[]]$Bytes)
+    try {
+        $text = [Text.Encoding]::UTF8.GetString($Bytes).TrimStart([char]0xFEFF)
+        if (-not $text.TrimStart().StartsWith('{')) { throw 'Expected an object.' }
+        $value = $text | ConvertFrom-Json
+        if ($null -eq $value -or $value -isnot [pscustomobject]) { throw 'Expected an object.' }
+        return $value
+    } catch { throw '配置不是有效的 JSON 对象。原文件未修改。' }
+}
+
+function Get-ConfigProperty {
+    param($Object, [string]$Name)
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -ne $property) { return $property.Value }
+}
+
+function Get-ClaudeLocalConfigs {
+    foreach ($root in @(Get-ClaudeConfigRoots)) {
+        $library = Join-Path $root 'configLibrary'
+        $metaPath = Join-Path $library '_meta.json'
+        if (-not (Test-Path -LiteralPath $metaPath)) { continue }
+        Assert-SafeBackupPath $metaPath
+        $metaBytes = [IO.File]::ReadAllBytes($metaPath)
+        $meta = Read-ConfigJson $metaBytes
+        $id = [string](Get-ConfigProperty $meta 'appliedId')
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+        $guid = [guid]::Empty
+        if (-not [guid]::TryParseExact($id, 'D', [ref]$guid)) { throw "本地配置的已应用编号无效：$metaPath" }
+        $path = Join-Path $library ($id + '.json')
+        Assert-SafeBackupPath $path
+        $bytes = [IO.File]::ReadAllBytes($path)
+        $data = Read-ConfigJson $bytes
+        $url = Get-ConfigProperty $data 'bootstrapUrl'
+        $enabled = Get-ConfigProperty $data 'bootstrapEnabled'
+        $active = $url -is [string] -and -not [string]::IsNullOrWhiteSpace($url) -and -not ($enabled -is [bool] -and -not $enabled)
+        [pscustomobject]@{
+            root = $root; id = $id; path = $path; metaPath = $metaPath
+            metaHash = (Get-BytesSha256 $metaBytes); hash = (Get-BytesSha256 $bytes)
+            bytes = $bytes; data = $data; bootstrapActive = $active
+        }
+    }
+}
+
+function Get-ClaudeDesktopRuntime {
+    $locations = @()
+    $launchers = @{}
+    $launch = $null
+    if (Test-CommandAvailable 'Get-AppxPackage') {
+        foreach ($package in @(Get-AppxPackage -Name 'Claude' -ErrorAction Stop)) {
+            $manifest = Get-AppxPackageManifest -Package $package.PackageFullName -ErrorAction Stop
+            foreach ($application in @($manifest.Package.Applications.Application)) {
+                if ([string]$application.Executable -notmatch '(?i)(^|\\)claude\.exe$') { continue }
+                $path = Join-Path $package.InstallLocation ([string]$application.Executable)
+                $locations += $path
+                $launchers[$path] = [pscustomobject]@{ file = (Join-Path $env:WINDIR 'explorer.exe'); argument = ('shell:AppsFolder\' + $package.PackageFamilyName + '!' + $application.Id) }
+                if ($null -eq $launch) {
+                    $launch = $launchers[$path]
+                }
+            }
+        }
+    }
+    $legacy = Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'
+    if ([IO.File]::Exists($legacy)) {
+        $locations += $legacy
+        if ($null -eq $launch) { $launch = [pscustomobject]@{ file = $legacy; argument = '' } }
+    }
+    $squirrelRoot = Join-Path $env:LOCALAPPDATA 'AnthropicClaude'
+    if ([IO.Directory]::Exists($squirrelRoot)) {
+        foreach ($directory in @(Get-ChildItem -LiteralPath $squirrelRoot -Directory -Filter 'app-*' | Sort-Object LastWriteTime -Descending)) {
+            $path = Join-Path $directory.FullName 'Claude.exe'
+            if (-not [IO.File]::Exists($path)) { continue }
+            $locations += $path
+            if ($null -eq $launch) { $launch = [pscustomobject]@{ file = $path; argument = '' } }
+        }
+    }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $session = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $processes = @()
+    $otherUsers = @()
+    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" -ErrorAction Stop)) {
+        # Claude Code also uses claude.exe. Only the installed Desktop executable is eligible.
+        $path = [string]$process.ExecutablePath
+        $isPackage = $false
+        foreach ($programs in @($env:ProgramFiles, $env:ProgramW6432) | Select-Object -Unique) {
+            if ([string]::IsNullOrWhiteSpace($programs)) { continue }
+            $pattern = '^' + [regex]::Escape((Join-Path $programs 'WindowsApps\Claude_')) + '[0-9.]+_(x64|x86|arm64)__pzs8sxrjxfjjc\\(?:app\\)?claude\.exe$'
+            if ($path -imatch $pattern) { $isPackage = $true }
+        }
+        # An elevated tool may not have the running user's MSIX registration.
+        # Recognize the Desktop installation layout before comparing its owner.
+        $isLegacy = $path -imatch '^[a-z]:\\.+\\AppData\\Local\\(?:Programs\\Claude\\Claude\.exe|AnthropicClaude\\app-[^\\]+\\Claude\.exe)$'
+        if ($path -notin $locations -and -not $isPackage -and -not $isLegacy) { continue }
+        $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
+        if ($owner.ReturnValue -ne 0) { throw '无法确认 Claude Desktop 的运行账户，请从运行 Claude 的 Windows 账户启动本工具。' }
+        if ($owner.Sid -ne $sid) { $otherUsers += [string]$owner.Sid; continue }
+        if ($process.SessionId -eq $session) {
+            $processes += $process
+            if (-not $isPackage -and -not $launchers.ContainsKey($path)) { $launchers[$path] = [pscustomobject]@{ file = $path; argument = '' } }
+        }
+    }
+    $runningPaths = @($processes | ForEach-Object { [string]$_.ExecutablePath } | Select-Object -Unique)
+    if ($runningPaths.Count -eq 1) { $launch = $launchers[$runningPaths[0]] }
+    elseif ($runningPaths.Count -gt 1) { throw '检测到多个版本的 Claude Desktop 正在运行，请先退出多余版本。' }
+    [pscustomobject]@{ processes = @($processes); otherUsers = @($otherUsers | Select-Object -Unique); launch = $launch }
+}
+
+function Assert-ClaudeDesktopAccount {
+    param($Runtime)
+    if ($Runtime.otherUsers.Count -gt 0) {
+        throw '检测到 Claude Desktop 正在另一个 Windows 账户中运行。请在该账户中直接双击本工具；不要使用其他管理员账户启动。该账户的用户策略不属于当前 HKCU。'
+    }
+}
+
+function Stop-ClaudeDesktop {
+    param($Runtime)
+    Assert-ClaudeDesktopAccount $Runtime
+    # Recheck PID identity after the user has confirmed, before ending any process.
+    $current = Get-ClaudeDesktopRuntime
+    Assert-ClaudeDesktopAccount $current
+    foreach ($process in $current.processes) {
+        $live = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $process.ProcessId) -ErrorAction Stop
+        # Electron children can exit as soon as the main process stops. WMI may
+        # briefly retain that PID with an empty executable path while it exits.
+        if ($null -eq $live -or [string]::IsNullOrWhiteSpace([string]$live.ExecutablePath)) { continue }
+        if ($live.CreationDate -ne $process.CreationDate -or $live.ExecutablePath -ne $process.ExecutablePath) { throw 'Claude 进程已经变化，请重新运行操作。' }
+        try { Stop-Process -Id $process.ProcessId -ErrorAction Stop }
+        catch {
+            if ($null -ne (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue)) { throw }
+        }
+    }
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $remaining = Get-ClaudeDesktopRuntime
+        Assert-ClaudeDesktopAccount $remaining
+        if ($remaining.processes.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 250
+    }
+    throw 'Claude Desktop 尚未完全退出，未修改本地配置。'
+}
+
+function Start-ClaudeDesktop {
+    param($Runtime)
+    if ($null -eq $Runtime.launch) { Write-Host '请重新打开 Claude Desktop。' -ForegroundColor Yellow; return }
+    if ([string]::IsNullOrEmpty($Runtime.launch.argument)) { Start-Process -FilePath $Runtime.launch.file }
+    else { Start-Process -FilePath $Runtime.launch.file -ArgumentList $Runtime.launch.argument }
+}
+
+function Invoke-ClaudeRefresh {
+    $runtime = Get-ClaudeDesktopRuntime
+    Assert-ClaudeDesktopAccount $runtime
+    if ($runtime.processes.Count -eq 0) { return }
+    Write-Host 'Claude Desktop 仍在运行，可能还在使用退出前的配置。' -ForegroundColor Yellow
+    Write-Host '保存 Claude 中的工作后，输入“确认重启”以完全退出并重新打开；直接回车跳过：'
+    if ((Read-Host).Trim() -cne '确认重启') { return }
+    Stop-ClaudeDesktop $runtime
+    Start-ClaudeDesktop $runtime
+    Write-Host '已重新启动 Claude Desktop，请检查设置。' -ForegroundColor Green
+}
+
+function Show-LocalConfigStatus {
+    param([switch]$Detailed)
+    Write-Section '应用设置'
+    $runtime = Get-ClaudeDesktopRuntime
+    Assert-ClaudeDesktopAccount $runtime
+    $configs = @(Get-ClaudeLocalConfigs)
+    if ($configs.Count -eq 0) { Write-Host '尚未设置本地连接配置。' }
+    foreach ($config in $configs) {
+        $state = if ($config.bootstrapActive) { '远程配置已开启，服务提供的设置会锁定。' } else { '使用本地配置，未开启远程限制。' }
+        Write-Host "  $state"
+        if ($Detailed) { Write-Host "  $($config.path)" -ForegroundColor DarkGray }
+    }
+    if ($runtime.processes.Count -gt 0) { Write-Host 'Claude 正在运行，配置变更需重启后生效。' -ForegroundColor Yellow }
+    return $configs
+}
+
+function Get-LocalConfigBackupRoot { Join-Path $DataRoot 'LocalConfigBackups' }
+
+function New-LocalConfigBackup {
+    param($Config)
+    $root = Get-LocalConfigBackupRoot
+    Assert-SafeBackupPath $root -AllowMissing
+    [void][IO.Directory]::CreateDirectory($root)
+    $directory = Join-Path $root ((Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($directory)
+    $manifest = [ordered]@{
+        tool = 'ClaudePolicyTool'; schema = 1; kind = 'LocalBootstrap'; createdUtc = [DateTime]::UtcNow.ToString('o')
+        userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; computerName = $env:COMPUTERNAME
+        dataRoot = $Config.root; profileId = $Config.id; sha256 = $Config.hash
+    }
+    [IO.File]::WriteAllBytes((Join-Path $directory 'config.json'), $Config.bytes)
+    Write-TextUtf8 (Join-Path $directory 'manifest.json') ($manifest | ConvertTo-Json -Depth 10)
+    Write-TextUtf8 (Join-Path $directory 'manifest.sha256') (Get-Sha256 (Join-Path $directory 'manifest.json'))
+    $null = Read-LocalConfigBackup $directory
+    return $directory
+}
+
+function Read-LocalConfigBackup {
+    param([string]$Directory)
+    $root = [IO.Path]::GetFullPath((Get-LocalConfigBackupRoot)).TrimEnd('\')
+    $full = [IO.Path]::GetFullPath($Directory).TrimEnd('\')
+    if ([IO.Path]::GetDirectoryName($full) -ine $root) { throw '本地配置备份必须位于工具的备份目录中。' }
+    $manifestPath = Join-Path $full 'manifest.json'
+    $filePath = Join-Path $full 'config.json'
+    $hashPath = Join-Path $full 'manifest.sha256'
+    Assert-SafeBackupPath $manifestPath
+    Assert-SafeBackupPath $filePath
+    Assert-SafeBackupPath $hashPath
+    $manifestBytes = [IO.File]::ReadAllBytes($manifestPath)
+    if ((Get-BytesSha256 $manifestBytes) -cne [IO.File]::ReadAllText($hashPath).Trim()) { throw '本地配置备份清单的完整性校验失败。' }
+    $manifest = Read-ConfigJson $manifestBytes
+    if ($manifest.tool -cne 'ClaudePolicyTool' -or $manifest.schema -ne 1 -or $manifest.kind -cne 'LocalBootstrap') { throw '本地配置备份格式不受支持。' }
+    if ($manifest.userSid -cne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or $manifest.computerName -ine $env:COMPUTERNAME) { throw '此备份不属于当前电脑和 Windows 账户。' }
+    if ([string]$manifest.dataRoot -notin @(Get-ClaudeConfigRoots)) { throw '本地配置备份的目标目录无效。' }
+    $guid = [guid]::Empty
+    if (-not [guid]::TryParseExact([string]$manifest.profileId, 'D', [ref]$guid)) { throw '本地配置备份的配置编号无效。' }
+    $bytes = [IO.File]::ReadAllBytes($filePath)
+    if ((Get-BytesSha256 $bytes) -cne $manifest.sha256) { throw '本地配置备份的完整性校验失败。' }
+    $null = Read-ConfigJson $bytes
+    [pscustomobject]@{ directory = $full; root = [string]$manifest.dataRoot; id = [string]$manifest.profileId; bytes = $bytes }
+}
+
+function Write-LocalConfigSnapshot {
+    param($Config, [byte[]]$Bytes)
+    Assert-SafeBackupPath $Config.path
+    Assert-SafeBackupPath $Config.metaPath
+    if ((Get-Sha256 $Config.path) -cne $Config.hash -or (Get-Sha256 $Config.metaPath) -cne $Config.metaHash) { throw '已应用的配置发生变化，请重新运行操作。' }
+    $null = Read-ConfigJson $Bytes
+    $temporary = Join-Path ([IO.Path]::GetDirectoryName($Config.path)) ([guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($Bytes, 0, $Bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        [IO.File]::Replace($temporary, $Config.path, [Management.Automation.Language.NullString]::Value)
+        if ((Get-Sha256 $Config.path) -cne (Get-BytesSha256 $Bytes)) { throw '本地配置写入校验失败。原文件已保存到备份目录。' }
+    } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+
+function Disable-LocalBootstrap {
+    param($Config)
+    if (-not $Config.bootstrapActive) { throw '此配置未启用远程配置。' }
+    $data = Read-ConfigJson $Config.bytes
+    $data | Add-Member -MemberType NoteProperty -Name bootstrapEnabled -Value $false -Force
+    $bytes = $Utf8NoBom.GetBytes(($data | ConvertTo-Json -Depth 100))
+    $backup = New-LocalConfigBackup $Config
+    Write-LocalConfigSnapshot $Config $bytes
+    return $backup
+}
+
+function Invoke-LocalConfigUnlock {
+    $runtime = Get-ClaudeDesktopRuntime
+    Assert-ClaudeDesktopAccount $runtime
+    $configs = @(Show-LocalConfigStatus)
+    if ($configs.Count -eq 0) { Invoke-ClaudeRefresh; return }
+    $index = 0
+    if ($configs.Count -gt 1) {
+        Write-Host '发现多个安装位置的配置，请选择要处理的一项：'
+        for ($i = 0; $i -lt $configs.Count; $i++) {
+            $source = if ($configs[$i].bootstrapActive) { '远程配置' } else { '本地配置' }
+            Write-Host (('{0}. {1}：{2}' -f ($i + 1), $source, $configs[$i].path))
+        }
+        $selection = 0
+        if (-not [int]::TryParse((Read-Host '选择需要解除限制的配置编号，回车取消'), [ref]$selection) -or $selection -lt 1 -or $selection -gt $configs.Count) { return }
+        $index = $selection - 1
+    }
+    if (-not $configs[$index].bootstrapActive) { Invoke-ClaudeRefresh; return }
+    Write-Host '将备份并关闭远程配置，保留已保存的本地设置。' -ForegroundColor Yellow
+    Write-Host '远程提供的 API 设置将不再加载，之后需填写自己的连接信息。'
+    Write-Host '请保存 Claude 中的工作。输入“确认解锁”继续，完成后会重启 Claude：'
+    if ((Read-Host).Trim() -cne '确认解锁') { return }
+    Stop-ClaudeDesktop $runtime
+    try {
+        $backup = Disable-LocalBootstrap $configs[$index]
+        Write-Host '远程配置已关闭，设置可在重启后修改。' -ForegroundColor Green
+        Write-Host "备份：$backup" -ForegroundColor DarkGray
+    } finally { Start-ClaudeDesktop $runtime }
+}
+
+function Get-LocalConfigBackupCandidates {
+    $root = Get-LocalConfigBackupRoot
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    Assert-SafeBackupPath $root
+    Get-ChildItem -LiteralPath $root -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json') } | Sort-Object Name -Descending
+}
+
+function Invoke-LocalConfigRestore {
+    $candidates = @(Get-LocalConfigBackupCandidates)
+    if ($candidates.Count -eq 0) { Write-Host '没有本地配置备份。'; return }
+    for ($i = 0; $i -lt $candidates.Count; $i++) { Write-Host ('{0}. {1}' -f ($i + 1), $candidates[$i].Name) }
+    $selection = 0
+    if (-not [int]::TryParse((Read-Host '选择本地配置备份编号，回车取消'), [ref]$selection) -or $selection -lt 1 -or $selection -gt $candidates.Count) { return }
+    $backup = Read-LocalConfigBackup $candidates[$selection - 1].FullName
+    $configs = @(Get-ClaudeLocalConfigs | Where-Object { $_.root -ieq $backup.root -and $_.id -ceq $backup.id })
+    if ($configs.Count -ne 1) { throw '备份对应的配置当前未应用。请先在 Claude 中切换到该配置，再恢复备份。' }
+    $runtime = Get-ClaudeDesktopRuntime
+    Assert-ClaudeDesktopAccount $runtime
+    Write-Host '请保存 Claude 中的工作。输入“确认恢复”继续，完成后会重启 Claude：'
+    if ((Read-Host).Trim() -cne '确认恢复') { return }
+    Stop-ClaudeDesktop $runtime
+    try {
+        $currentBackup = New-LocalConfigBackup $configs[0]
+        Write-LocalConfigSnapshot $configs[0] $backup.bytes
+        Write-Host "本地配置已恢复。恢复前备份：$currentBackup" -ForegroundColor Green
+    } finally { Start-ClaudeDesktop $runtime }
+}
+
+function Invoke-RestoreMenu {
+    if (@(Get-LocalConfigBackupCandidates).Count -eq 0) { Invoke-RestoreInteractive; return }
+    Write-Host '1. 恢复注册表策略备份'
+    Write-Host '2. 恢复本地配置备份'
+    switch ((Read-Host '选择备份类型，回车取消').Trim()) {
+        '1' { Invoke-RestoreInteractive }
+        '2' { Invoke-LocalConfigRestore }
+    }
+}
+
 function Show-PolicyStatus {
-    param([object[]]$Targets = $ProductionTargets)
-    Write-Section 'Claude Desktop 策略状态'
+    param([object[]]$Targets = $ProductionTargets, [switch]$Detailed)
+    Write-Section '管理策略'
     $present = 0
+    $scopes = @()
     $readErrors = @()
     foreach ($target in $Targets) {
         $scope = if ($target.hive -eq 'HKLM') { '整台电脑' } else { '当前用户' }
         try {
             $exists = Test-TargetExists $target
-            if ($exists) { $present++ }
+            if ($exists) { $present++; $scopes += $scope }
             $color = if ($exists) { 'Yellow' } else { 'Green' }
             $state = if ($exists) { '存在策略' } else { '未发现策略' }
         } catch {
@@ -760,77 +1084,70 @@ function Show-PolicyStatus {
             $color = 'Red'
             $state = '读取失败，状态未知'
         }
-        Write-Host ('  [{0} / {1} 位]  {2}' -f $scope, $target.view, $state) -ForegroundColor $color
-        Write-Host "      $($target.regPath)" -ForegroundColor DarkGray
+        if ($Detailed) {
+            Write-Host ('  [{0} / {1} 位]  {2}' -f $scope, $target.view, $state) -ForegroundColor $color
+            Write-Host "      $($target.regPath)" -ForegroundColor DarkGray
+        }
     }
     Write-Host ''
     if ($readErrors.Count -gt 0) {
         throw ("策略检查不完整，已停止操作。读取失败不等于没有策略：`n  - " + ($readErrors -join "`n  - "))
     }
     if ($present -gt 0) {
-        Write-Host '检测到 Claude Desktop 管理策略，第三方推理配置窗口可能处于只读状态。' -ForegroundColor Yellow
+        Write-Host ('发现管理策略：' + ((@($scopes | Select-Object -Unique)) -join '、') + '。') -ForegroundColor Yellow
     } else {
-        Write-Host '检查范围内未发现 Claude Desktop 管理策略，无需解锁。' -ForegroundColor Green
-        Write-Host '页面是否可编辑还取决于应用自身的配置。本工具不会创建 API 地址、密钥或模型配置。' -ForegroundColor Yellow
-        Write-Host '若使用 Claude Code 或通过 CC Switch 管理配置，请核对所选应用及其 API 设置。'
-        Write-Host '若 Claude Desktop 仍显示“由组织管理”，请提供应用版本、被锁定页面截图和 --diagnose 输出，分享前遮挡敏感信息。'
+        Write-Host '注册表中没有管理策略。'
     }
     $management = @(Get-ManagementState)
     if ($management.Count -gt 0) {
         Write-Host ''
-        Write-Host '检测到组织管理迹象，策略可能被重新下发：' -ForegroundColor Yellow
-        $management | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+        Write-Host '这台电脑有组织管理设置，限制可能会重新生效。' -ForegroundColor Yellow
+        if ($Detailed) { $management | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow } }
     }
     return $present
 }
 
 function Show-RestartInstructions {
     Write-Host ''
-    Write-Host '为避免丢失正在进行的会话，本工具不会强制结束 Claude 进程。' -ForegroundColor Yellow
-    Write-Host '请保存当前工作，完全退出 Claude Desktop（包括系统托盘），然后手动重新打开。' -ForegroundColor Yellow
+    Write-Host '请保存当前工作，完全退出 Claude Desktop（包括系统托盘）后重新打开。' -ForegroundColor Yellow
 }
 
 function Show-Diagnostics {
-    $report = Show-CompatibilityReport
-    $null = Show-PolicyStatus
-    Write-Section '诊断结论'
+    param([switch]$Detailed)
+    $report = if ($Detailed) { Show-CompatibilityReport } else { Get-CompatibilityReport }
+    $null = Show-PolicyStatus -Detailed:$Detailed
+    $null = Show-LocalConfigStatus -Detailed:$Detailed
+    Write-Section '检查结果'
     if (-not $report.ready) {
-        Write-Host '当前环境不适合执行解锁或恢复。请先处理上方红色问题。' -ForegroundColor Red
+        if (-not $Detailed) { $report.errors | ForEach-Object { Write-Host $_ -ForegroundColor Red } }
+        Write-Host '请先处理上述问题，再进行解锁或恢复。' -ForegroundColor Red
     } else {
-        Write-Host '运行条件检查通过。写入前仍需确认操作，并完成备份和校验。' -ForegroundColor Green
+        Write-Host '检查完成。设置仍受限时，可选择“解除限制”继续。' -ForegroundColor Green
     }
 }
 
 function Show-Help {
     Write-Section '使用说明'
-    Write-Host '先选 1 诊断；发现需要移除的 Desktop 策略时选 2；需要恢复备份时选 3。' -ForegroundColor Green
-    Write-Host '工具检查 HKLM/HKCU 下的 SOFTWARE\Policies\Claude 策略键。'
-    Write-Host '确认解锁后，先备份并校验，再删除策略；恢复时会另存当前状态，并核对恢复结果。'
-    Write-Host ''
-    Write-Host 'API 地址、密钥和模型配置需在对应应用中设置。移除策略不保证页面可编辑。' -ForegroundColor Yellow
-    Write-Host 'ClaudeCode 策略、Claude Code / CC Switch 配置文件及其他软件策略不在处理范围内。'
-    Write-Host '显示“未发现策略”时无需解锁。受组织管理的设备请先取得管理员授权。'
-    Write-Host ''
-    Write-Host '工具不联网，也不上传本机数据。备份可能含有凭据，请妥善保管。'
-    Write-Host '操作后请保存工作，完全退出 Claude Desktop，再手动重新打开。'
-    Write-Host "备份保存在：$BackupRoot" -ForegroundColor Green
+    Write-Host '先检查设置，再选择“解除限制”。每次修改前会自动备份，可在“恢复备份”中撤销。'
+    Write-Host '解除管理配置后，可能需要填写自己的 API 连接信息。'
+    Write-Host '关闭或重启 Claude 前，请先保存工作。公司或学校的电脑请先取得管理员同意。'
+    Write-Host '备份可能包含密钥，请妥善保管。'
+    Write-Host "备份目录：$DataRoot" -ForegroundColor DarkGray
 }
 
 function Invoke-Unlock {
     Write-Title
     $present = Show-PolicyStatus
     if ($present -eq 0) {
-        Write-Host ''
-        Write-Host '当前没有需要解锁的策略，未修改注册表。' -ForegroundColor Green
+        Invoke-LocalConfigUnlock
         return
     }
     Ensure-Administrator '--unlock'
     Assert-CompatibleForWrite
 
     Write-Host ''
-    Write-Host '接下来会先完整备份，然后只删除上方列出的 Claude 策略键。' -ForegroundColor White
-    Write-Host '注意：备份可能包含管理员配置的 URL、请求头或凭据，请勿上传或分享备份目录。' -ForegroundColor Yellow
-    Write-Host '目标策略中包含的 API 地址、凭据或模型设置也会随策略移除；本工具不会生成替代配置。' -ForegroundColor Yellow
+    Write-Host '将备份并移除管理策略，可通过“恢复备份”撤销。'
+    Write-Host '策略中的 API 地址和密钥也会移除，之后可能需要重新填写。' -ForegroundColor Yellow
     $management = @(Get-ManagementState)
     if ($management.Count -gt 0) {
         Write-Host ''
@@ -850,7 +1167,7 @@ function Invoke-Unlock {
 
     $backupDirectory = New-BackupSet $ProductionTargets $BackupRoot 'BeforeUnlock'
     $validated = Read-ValidatedBackup $backupDirectory $ProductionTargets $BackupRoot
-    Write-Host "备份已完成并通过完整性校验：$backupDirectory" -ForegroundColor Green
+    Write-Host "备份：$backupDirectory" -ForegroundColor DarkGray
 
     try {
         Remove-AllTargets $ProductionTargets
@@ -868,6 +1185,7 @@ function Invoke-Unlock {
     Write-Host 'Claude Desktop 管理策略已移除。请重新打开应用检查设置。' -ForegroundColor Green
     Write-Host "用于恢复的原始备份：$backupDirectory" -ForegroundColor Green
     Show-RestartInstructions
+    Invoke-ClaudeRefresh
 }
 
 function Get-BackupCandidates {
@@ -1131,20 +1449,18 @@ function Invoke-SelfTest {
 function Show-Menu {
     while ($true) {
         Write-Title
-        Write-Host '1. 运行环境与策略诊断（只读，建议先运行）'
-        Write-Host '2. 解锁 Claude Desktop 第三方推理设置'
-        Write-Host '3. 恢复经过校验的策略备份'
-        Write-Host '4. 运行安全性隔离自检（不触碰真实策略）'
-        Write-Host '5. 查看使用说明与安全须知'
-        Write-Host '6. 退出'
+        Write-Host '1. 检查设置'
+        Write-Host '2. 解除限制'
+        Write-Host '3. 恢复备份'
+        Write-Host '4. 使用说明'
+        Write-Host '0. 退出'
         Write-Host ''
         switch ((Read-Host '请输入选项编号').Trim()) {
             '1' { Write-Title; Show-Diagnostics; Pause-Console }
             '2' { Invoke-Unlock; Pause-Console }
-            '3' { Invoke-RestoreInteractive; Pause-Console }
-            '4' { Invoke-SelfTest; Pause-Console }
-            '5' { Write-Title; Show-Help; Pause-Console }
-            '6' { return }
+            '3' { Invoke-RestoreMenu; Pause-Console }
+            '4' { Write-Title; Show-Help; Pause-Console }
+            '0' { return }
             default { Write-Host '选项无效，请重新输入。' -ForegroundColor Yellow; Start-Sleep -Seconds 1 }
         }
     }
@@ -1153,10 +1469,10 @@ function Show-Menu {
 try {
     Assert-UserContext $env:CPT_EXPECTED_SID
     switch ($Action.ToLowerInvariant()) {
-        '--status' { Write-Title; $null = Show-PolicyStatus }
-        '--diagnose' { Write-Title; Show-Diagnostics }
+        '--status' { Write-Title; $null = Show-PolicyStatus; $null = Show-LocalConfigStatus }
+        '--diagnose' { Write-Title; Show-Diagnostics -Detailed }
         '--unlock' { Invoke-Unlock; Pause-Console }
-        '--restore' { Invoke-RestoreInteractive; Pause-Console }
+        '--restore' { Invoke-RestoreMenu; Pause-Console }
         '--self-test' { Invoke-SelfTest }
         '--help' { Write-Title; Show-Help }
         default { Show-Menu }
