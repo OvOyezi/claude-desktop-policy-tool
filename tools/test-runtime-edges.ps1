@@ -1,11 +1,16 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$ToolPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'Claude-Policy-Tool.cmd'),
+    [string]$ToolPath,
     [Parameter(Mandatory = $true)][string]$ResultPath
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# Resolve the default in the script body for Windows PowerShell 5.1 -File.
+if (-not $PSBoundParameters.ContainsKey('ToolPath')) {
+    $ToolPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Claude-Policy-Tool.cmd'
+}
 
 # Run only in an isolated Windows test environment. The only real entrypoint run is
 # --status with an intentionally wrong SID; no write action or UAC is requested.

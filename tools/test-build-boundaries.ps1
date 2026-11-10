@@ -1,11 +1,17 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$BuilderPath = (Join-Path $PSScriptRoot 'build-release.ps1'),
+    [string]$BuilderPath,
     [Parameter(Mandatory = $true)][string]$ResultPath
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# Resolve the default in the script body for Windows PowerShell 5.1 -File.
+if (-not $PSBoundParameters.ContainsKey('BuilderPath')) {
+    $BuilderPath = Join-Path $PSScriptRoot 'build-release.ps1'
+}
+
 $script:results = New-Object 'System.Collections.Generic.List[object]'
 $script:links = New-Object 'System.Collections.Generic.List[object]'
 $testId = [guid]::NewGuid().ToString('N')
